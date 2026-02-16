@@ -1,11 +1,11 @@
 #!/bin/bash
 
 # ChatGen Pro - Interactive Installer
-# App: chatsroom
-# Folder: ~/chat-chatsroom
+# App: chatroom
+# Folder: ~/chat-chatroom
 
-DIR="~/chat-chatsroom"
-APP_NAME="chatsroom"
+DIR="~/chat-chatroom"
+APP_NAME="chatroom"
 
 # 1. Interactive Input
 echo "========================================"
@@ -14,6 +14,9 @@ echo "========================================"
 echo ""
 echo "Please configure your chat server:"
 echo ""
+
+read -p "Chat Room Name [default: chatroom]: " INPUT_APP_NAME
+APP_NAME_VAL=${INPUT_APP_NAME:-chatroom}
 
 read -p "Admin Username [default: admin]: " INPUT_USER
 ADMIN_USER=${INPUT_USER:-admin}
@@ -74,7 +77,7 @@ cd "$DIR"
 # package.json (Added multer)
 cat > package.json << 'EOF'
 {
-  "name": "chatsroom",
+  "name": "chatroom",
   "version": "1.0.0",
   "main": "server.js",
   "scripts": {
@@ -122,7 +125,8 @@ let appConfig = {
   adminUser: 'admin',
   adminPass: 'admin123',
   port: 3000,
-  maxFileSizeMB: 50
+  maxFileSizeMB: 50,
+  appName: 'Chat App'
 };
 
 function loadConfig() {
@@ -216,12 +220,21 @@ io.on('connection', (socket) => {
 
   socket.on('login', ({ username, password }) => {
     username = username.trim();
+    loadConfig(); // Refresh config on login
     
     // Check Admin (Read from current config)
     if (username === appConfig.adminUser) {
       if (password === appConfig.adminPass) {
         users[socket.id] = { username, role: 'admin' };
-        socket.emit('login_success', { username, role: 'admin', channels, settings: { maxFileSizeMB: appConfig.maxFileSizeMB } });
+        socket.emit('login_success', { 
+            username, 
+            role: 'admin', 
+            channels, 
+            settings: { 
+                maxFileSizeMB: appConfig.maxFileSizeMB,
+                appName: appConfig.appName 
+            } 
+        });
         joinChannel(socket, 'General');
         io.emit('user_list', getUniqueOnlineUsers());
         return;
@@ -253,7 +266,15 @@ io.on('connection', (socket) => {
     const role = persistentUsers[username].role;
     users[socket.id] = { username, role };
     
-    socket.emit('login_success', { username, role, channels, settings: { maxFileSizeMB: appConfig.maxFileSizeMB } });
+    socket.emit('login_success', { 
+        username, 
+        role, 
+        channels, 
+        settings: { 
+            maxFileSizeMB: appConfig.maxFileSizeMB,
+            appName: appConfig.appName
+        } 
+    });
     joinChannel(socket, 'General');
     io.emit('user_list', getUniqueOnlineUsers());
   });
@@ -456,7 +477,7 @@ cat > public/index.html << 'EOF'
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
-    <title>chatsroom</title>
+    <title>__APP_NAME_PLACEHOLDER__</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <link href="https://fonts.googleapis.com/css2?family=Vazirmatn:wght@300;400;700&display=swap" rel="stylesheet">
     <script src="/socket.io/socket.io.js"></script>
@@ -526,8 +547,6 @@ cat > public/index.html << 'EOF'
 <body class="w-full overflow-hidden flex flex-col text-gray-800">
     <!-- Application Logic remains the same, managed by Vue -->
     <div id="app" class="h-full flex flex-col w-full">
-        <!-- ... (Rest of HTML structure is identical to previous, preserved via Vue logic) ... -->
-        <!-- (Reusing the exact same HTML structure for brevity as the only changes were backend/setup) -->
         
         <!-- Login Screen -->
         <div v-if="!isLoggedIn" class="fixed inset-0 bg-gray-900 bg-opacity-95 flex items-center justify-center z-50 p-4">
@@ -535,7 +554,7 @@ cat > public/index.html << 'EOF'
                 <div class="w-16 h-16 bg-brand rounded-full mx-auto flex items-center justify-center mb-4 text-white text-2xl">
                     <i class="fas fa-comments"></i>
                 </div>
-                <h1 class="text-2xl font-bold mb-2 text-brand-dark">chatsroom</h1>
+                <h1 class="text-2xl font-bold mb-2 text-brand-dark">{{ appName }}</h1>
                 <p class="text-xs text-gray-500 mb-6">برای ورود یا ثبت نام اطلاعات زیر را وارد کنید</p>
                 <div class="space-y-4">
                     <input v-model="loginForm.username" @keyup.enter="login" placeholder="نام کاربری" class="w-full p-3 border rounded-xl focus:ring-2 focus:ring-brand outline-none text-center dir-rtl">
@@ -555,7 +574,7 @@ cat > public/index.html << 'EOF'
                 <div class="p-4 bg-gradient-to-l from-brand to-brand-dark text-white shadow shrink-0">
                     <div class="flex justify-between items-center">
                          <div>
-                            <h2 class="font-bold text-lg">chatsroom</h2>
+                            <h2 class="font-bold text-lg">{{ appName }}</h2>
                             <p class="text-xs opacity-90 mt-1 flex items-center gap-1">
                                 <i class="fas fa-user-circle"></i> {{ user.username }}
                                 <span v-if="user.role === 'admin'" class="bg-yellow-400 text-black px-1 rounded text-[9px] font-bold">مدیر</span>
@@ -774,7 +793,6 @@ cat > public/index.html << 'EOF'
                      :style="{ top: contextMenu.y + 'px', left: contextMenu.x + 'px' }" 
                      class="context-menu"
                      @click.stop>
-                    <!-- (Context menu content remains same) -->
                     <template v-if="contextMenu.type === 'message'">
                         <div @click="setReply(contextMenu.target); contextMenu.visible = false" class="px-3 py-2 hover:bg-gray-100 cursor-pointer text-sm flex items-center gap-2">
                             <i class="fas fa-reply text-gray-400 w-4"></i> پاسخ
@@ -808,7 +826,6 @@ cat > public/index.html << 'EOF'
         
         <!-- Ban List Modal -->
         <div v-if="showBanModal" class="fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-4">
-             <!-- (Modal content remains same) -->
             <div class="bg-white rounded-xl shadow-xl w-full max-w-md overflow-hidden flex flex-col max-h-[80vh]">
                 <div class="p-4 border-b flex justify-between items-center bg-gray-50">
                     <h3 class="font-bold text-gray-700">لیست سیاه (بن شده‌ها)</h3>
@@ -833,7 +850,6 @@ cat > public/index.html << 'EOF'
         </div>
     </div>
 
-    <!-- Vue Scripts ... -->
     <script>
         const { createApp, ref, onMounted, nextTick, computed, watch } = Vue;
         const socket = io();
@@ -844,6 +860,7 @@ cat > public/index.html << 'EOF'
                 const user = ref({ username: '', role: 'user' });
                 const loginForm = ref({ username: '', password: '' });
                 const error = ref('');
+                const appName = ref('__APP_NAME_PLACEHOLDER__'); 
                 
                 const channels = ref(['General']);
                 const currentChannel = ref('General');
@@ -1049,7 +1066,13 @@ cat > public/index.html << 'EOF'
                     isLoggedIn.value = true;
                     user.value = { username: data.username, role: data.role };
                     channels.value = data.channels;
-                    if(data.settings) appSettings.value = data.settings;
+                    if(data.settings) {
+                        appSettings.value = data.settings;
+                        if(data.settings.appName) {
+                            appName.value = data.settings.appName;
+                            document.title = data.settings.appName;
+                        }
+                    }
                     localStorage.setItem('chat_user_name', data.username);
                 });
                 socket.on('login_error', (msg) => error.value = msg);
@@ -1157,7 +1180,7 @@ cat > public/index.html << 'EOF'
                     swipeId, touchStart, touchMove, touchEnd, getSwipeStyle,
                     isRecording, isUploading, uploadProgress, toggleRecording, viewImage, lightboxImage, autoResize, scrollToMessage,
                     canCreateChannel, canBan, banUser, unbanUser, setRole,
-                    showBanModal, openBanList, bannedUsers, unreadCounts
+                    showBanModal, openBanList, bannedUsers, unreadCounts, appName
                 };
             }
         }).mount('#app');
@@ -1173,12 +1196,15 @@ cat > data/config.json << EOF
   "adminUser": "$ADMIN_USER",
   "adminPass": "$ADMIN_PASS",
   "port": $PORT,
-  "maxFileSizeMB": 50
+  "maxFileSizeMB": 50,
+  "appName": "$APP_NAME_VAL"
 }
 EOF
 
-# 4. Apply Color Configuration
-echo "[4/6] Applying color theme..."
+# 4. Apply App Name & Color Configuration
+echo "[4/6] Applying configuration..."
+sed -i "s|__APP_NAME_PLACEHOLDER__|$APP_NAME_VAL|g" public/index.html
+
 sed -i "s|__COLOR_DEFAULT__|$C_DEF|g" public/index.html
 sed -i "s|__COLOR_DARK__|$C_DARK|g" public/index.html
 sed -i "s|__COLOR_LIGHT__|$C_LIGHT|g" public/index.html
@@ -1202,9 +1228,10 @@ cat << 'EOF_MENU' > /tmp/chat-menu.sh
 #!/bin/bash
 # Chat Manager Menu
 
-APP_NAME="chatsroom"
-DIR="~/chat-chatsroom"
+APP_NAME="chatroom"
+DIR="~/chat-chatroom"
 CONFIG_FILE="$DIR/data/config.json"
+INDEX_FILE="$DIR/public/index.html"
 
 while true; do
     clear
@@ -1215,7 +1242,7 @@ while true; do
     echo "2. Restart Server"
     echo "3. Stop Server"
     echo "4. View Logs"
-    echo "5. Settings (User/Pass/Size)"
+    echo "5. Settings (User/Pass/Size/Name)"
     echo "6. Uninstall / Delete"
     echo "7. Exit"
     echo "==================================="
@@ -1233,12 +1260,12 @@ while true; do
            echo "a) Change Admin Username"
            echo "b) Change Admin Password"
            echo "c) Change Max Upload Size (MB)"
+           echo "d) Change App Name"
            read -p "Select option: " subopt
            
            case $subopt in
                a)
                   read -p "New Username: " NEW_USER
-                  # Simple python inline edit because bash JSON is hard, or node
                   node -e "const fs=require('fs'); const p='$CONFIG_FILE'; const d=JSON.parse(fs.readFileSync(p)); d.adminUser='$NEW_USER'; fs.writeFileSync(p, JSON.stringify(d,null,2));"
                   echo "Updated. Restarting..."
                   pm2 restart "$APP_NAME"
@@ -1258,6 +1285,18 @@ while true; do
                   else
                       echo "Invalid number."
                   fi
+                  ;;
+               d)
+                  read -p "New App Name: " NEW_APP_NAME
+                  # Update Config
+                  node -e "const fs=require('fs'); const p='$CONFIG_FILE'; const d=JSON.parse(fs.readFileSync(p)); d.appName='$NEW_APP_NAME'; fs.writeFileSync(p, JSON.stringify(d,null,2));"
+                  # Update Title
+                  sed -i "s|<title>.*</title>|<title>$NEW_APP_NAME</title>|g" "$INDEX_FILE"
+                  # Update Vue Var
+                  sed -i "s|appName = ref('.*');|appName = ref('$NEW_APP_NAME');|g" "$INDEX_FILE"
+                  
+                  echo "Updated. Restarting..."
+                  pm2 restart "$APP_NAME"
                   ;;
            esac
            read -p "Press Enter..."
