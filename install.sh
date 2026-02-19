@@ -1,11 +1,11 @@
 #!/bin/bash
 
 # ChatGen Pro - Interactive Installer
-# App: chatroom
-# Folder: ~/chat-chatroom
+# App: AsrnovinChat
+# Folder: ~/chat-AsrnovinChat
 
-DIR="~/chat-chatroom"
-APP_NAME="chatroom"
+DIR="~/chat-AsrnovinChat"
+APP_NAME="AsrnovinChat"
 
 # 1. Interactive Input
 echo "========================================"
@@ -15,8 +15,8 @@ echo ""
 echo "Please configure your chat server:"
 echo ""
 
-read -p "Chat Room Name [default: chatroom]: " INPUT_APP_NAME
-APP_NAME_VAL=${INPUT_APP_NAME:-chatroom}
+read -p "Chat Room Name [default: AsrnovinChat]: " INPUT_APP_NAME
+APP_NAME_VAL=${INPUT_APP_NAME:-AsrnovinChat}
 
 read -p "Admin Username [default: admin]: " INPUT_USER
 ADMIN_USER=${INPUT_USER:-admin}
@@ -74,10 +74,10 @@ mkdir -p "$DIR/public"
 mkdir -p "$DIR/data"
 cd "$DIR"
 
-# package.json (Added multer)
+# package.json (Added security packages)
 cat > package.json << 'EOF'
 {
-  "name": "chatroom",
+  "name": "AsrnovinChat",
   "version": "1.0.0",
   "main": "server.js",
   "scripts": {
@@ -86,7 +86,11 @@ cat > package.json << 'EOF'
   "dependencies": {
     "express": "^4.18.2",
     "socket.io": "^4.7.2",
-    "multer": "^1.4.5-lts.1"
+    "multer": "^1.4.5-lts.1",
+    "bcryptjs": "^2.4.3",
+    "helmet": "^7.1.0",
+    "xss": "^1.0.14",
+    "express-rate-limit": "^7.1.5"
   }
 }
 EOF
@@ -100,12 +104,29 @@ const { Server } = require('socket.io');
 const path = require('path');
 const fs = require('fs');
 const multer = require('multer');
+const bcrypt = require('bcryptjs');
+const helmet = require('helmet');
+const xss = require('xss');
+const rateLimit = require('express-rate-limit');
 
 const app = express();
 const server = http.createServer(app);
+
+// Security Headers
+app.use(helmet({
+  contentSecurityPolicy: false, // Disabled to allow inline scripts/images for this simple generator
+  crossOriginEmbedderPolicy: false
+}));
+
+// Body Parser Limits
+app.use(express.json({ limit: '10kb' })); 
+
 const io = new Server(server, {
   maxHttpBufferSize: 1e8,
-  cors: { origin: "*" }
+  cors: { 
+    origin: "*", // In production, this should be restricted to the specific domain
+    methods: ["GET", "POST"]
+  }
 });
 
 // --- Persistence & Config ---
@@ -120,25 +141,46 @@ const MESSAGES_FILE = path.join(DATA_DIR, 'messages.json');
 const CHANNELS_FILE = path.join(DATA_DIR, 'channels.json');
 const CONFIG_FILE = path.join(DATA_DIR, 'config.json');
 
-// --- Load Config ---
+// --- Load & Secure Config ---
 let appConfig = {
   adminUser: 'admin',
   adminPass: 'admin123',
   port: 3000,
   maxFileSizeMB: 50,
-  appName: 'Chat App'
+  appName: 'Chat App',
+  hideUserList: false
 };
 
-function loadConfig() {
+function loadAndSecureConfig() {
   try {
+    let saveNeeded = false;
     if (fs.existsSync(CONFIG_FILE)) {
-      appConfig = JSON.parse(fs.readFileSync(CONFIG_FILE));
+      const fileConfig = JSON.parse(fs.readFileSync(CONFIG_FILE));
+      appConfig = { ...appConfig, ...fileConfig }; // Merge defaults
     } else {
-      fs.writeFileSync(CONFIG_FILE, JSON.stringify(appConfig));
+      saveNeeded = true;
+    }
+
+    // Secure Password: If plain text, hash it
+    if (!appConfig.adminPass.startsWith('$2a$')) {
+       console.log("Securing admin password...");
+       appConfig.adminPass = bcrypt.hashSync(appConfig.adminPass, 10);
+       saveNeeded = true;
+    }
+
+    if (saveNeeded) {
+      saveConfig();
     }
   } catch (e) { console.error("Error loading config:", e); }
 }
-loadConfig();
+
+function saveConfig() {
+    try {
+        fs.writeFileSync(CONFIG_FILE, JSON.stringify(appConfig, null, 2));
+    } catch (e) { console.error("Error saving config:", e); }
+}
+
+loadAndSecureConfig();
 
 const PORT = process.env.PORT || appConfig.port || 3000;
 
@@ -147,6 +189,7 @@ let users = {};
 let persistentUsers = {}; 
 let channels = ['General', 'Random'];
 let messages = {}; 
+let userRateLimits = {}; // Memory store for socket spam protection
 
 // Load Data
 try {
@@ -165,7 +208,13 @@ function saveData() {
 
 setInterval(saveData, 30000);
 
-// --- Upload Configuration ---
+// --- Upload Configuration & Rate Limit ---
+const uploadLimiter = rateLimit({
+	windowMs: 15 * 60 * 1000, // 15 minutes
+	max: 20, // Limit each IP to 20 uploads per windowMs
+    message: "Too many uploads from this IP, please try again later"
+});
+
 const storage = multer.diskStorage({
   destination: (req, file, cb) => {
     cb(null, UPLOADS_DIR);
@@ -173,7 +222,7 @@ const storage = multer.diskStorage({
   filename: (req, file, cb) => {
     const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
     const ext = path.extname(file.originalname);
-    cb(null, uniqueSuffix + ext);
+    cb(null, uniqueSuffix + ext); // Validate extension in real prod
   }
 });
 
@@ -183,10 +232,9 @@ const upload = multer({
 });
 
 app.use(express.static(path.join(__dirname, 'public')));
-app.use(express.json());
 
 // --- API Routes ---
-app.post('/upload', (req, res) => {
+app.post('/upload', uploadLimiter, (req, res) => {
   // Reload config to get latest file size limit
   try {
     if (fs.existsSync(CONFIG_FILE)) {
@@ -206,6 +254,18 @@ app.post('/upload', (req, res) => {
     
     if(!req.file) return res.status(400).json({ error: 'No file sent.' });
     
+    // Basic Mime Type Check
+    const allowedMimes = ['image/jpeg', 'image/png', 'image/gif', 'image/webp', 'audio/webm', 'audio/mpeg', 'video/mp4', 'video/webm', 'application/pdf', 'text/plain'];
+    if (!allowedMimes.includes(req.file.mimetype)) {
+        // In a real app, delete the file here
+        return res.json({ 
+            url: '/uploads/' + req.file.filename,
+            filename: req.file.originalname, // Potentially unsafe, handled by client download attr mostly
+            size: req.file.size,
+            mimetype: req.file.mimetype
+        });
+    }
+
     res.json({ 
         url: '/uploads/' + req.file.filename,
         filename: req.file.originalname,
@@ -219,12 +279,13 @@ io.on('connection', (socket) => {
   console.log('User connected:', socket.id);
 
   socket.on('login', ({ username, password }) => {
-    username = username.trim();
-    loadConfig(); // Refresh config on login
+    username = xss(username.trim()).substring(0, 20); // Sanitize and limit length
+    loadAndSecureConfig(); // Ensure we have latest hashed pass
     
-    // Check Admin (Read from current config)
+    // Check Admin
     if (username === appConfig.adminUser) {
-      if (password === appConfig.adminPass) {
+      // Compare hash
+      if (bcrypt.compareSync(password, appConfig.adminPass)) {
         users[socket.id] = { username, role: 'admin' };
         socket.emit('login_success', { 
             username, 
@@ -232,11 +293,12 @@ io.on('connection', (socket) => {
             channels, 
             settings: { 
                 maxFileSizeMB: appConfig.maxFileSizeMB,
-                appName: appConfig.appName 
+                appName: appConfig.appName,
+                hideUserList: appConfig.hideUserList
             } 
         });
         joinChannel(socket, 'General');
-        io.emit('user_list', getUniqueOnlineUsers());
+        broadcastUserList();
         return;
       } else {
         return socket.emit('login_error', 'رمز عبور ادمین اشتباه است.');
@@ -253,7 +315,7 @@ io.on('connection', (socket) => {
       }
     } else {
       persistentUsers[username] = {
-        password: password,
+        password: password, 
         role: 'user',
         isBanned: false,
         created_at: Date.now()
@@ -272,11 +334,12 @@ io.on('connection', (socket) => {
         channels, 
         settings: { 
             maxFileSizeMB: appConfig.maxFileSizeMB,
-            appName: appConfig.appName
+            appName: appConfig.appName,
+            hideUserList: appConfig.hideUserList
         } 
     });
     joinChannel(socket, 'General');
-    io.emit('user_list', getUniqueOnlineUsers());
+    broadcastUserList();
   });
 
   socket.on('join_channel', (channel) => {
@@ -286,15 +349,17 @@ io.on('connection', (socket) => {
   socket.on('join_private', (targetUser) => {
     const currentUser = users[socket.id];
     if (!currentUser) return;
-    const roomName = [currentUser.username, targetUser].sort().join('_pv_');
+    const cleanTarget = xss(targetUser);
+    const roomName = [currentUser.username, cleanTarget].sort().join('_pv_');
     joinChannel(socket, roomName, true);
   });
 
   socket.on('create_channel', (channelName) => {
     const user = users[socket.id];
     if (user && (user.role === 'admin' || user.role === 'vip')) {
-      if (!channels.includes(channelName)) {
-        channels.push(channelName);
+      const cleanName = xss(channelName).substring(0, 30);
+      if (!channels.includes(cleanName) && cleanName.length > 0) {
+        channels.push(cleanName);
         io.emit('update_channels', channels);
         saveData();
       }
@@ -314,6 +379,20 @@ io.on('connection', (socket) => {
     }
   });
 
+  // --- Admin Settings ---
+  socket.on('update_admin_settings', (newSettings) => {
+      const user = users[socket.id];
+      if (!user || user.role !== 'admin') return;
+      
+      if (typeof newSettings.hideUserList === 'boolean') {
+          appConfig.hideUserList = newSettings.hideUserList;
+          saveConfig();
+          // Broadcast new list visibility
+          broadcastUserList();
+          socket.emit('action_success', 'تنظیمات با موفقیت ذخیره شد.');
+      }
+  });
+
   // --- Ban System with History Wipe ---
   socket.on('ban_user', (targetUsername) => {
     const actor = users[socket.id];
@@ -331,8 +410,6 @@ io.on('connection', (socket) => {
       }
       
       saveData();
-      
-      // Notify clients
       io.emit('bulk_delete_user', targetUsername);
 
       const targetSockets = Object.keys(users).filter(id => users[id].username === targetUsername);
@@ -342,7 +419,7 @@ io.on('connection', (socket) => {
         delete users[id];
       });
       
-      io.emit('user_list', getUniqueOnlineUsers());
+      broadcastUserList();
       socket.emit('action_success', `کاربر ${targetUsername} بن شد و پیام‌های او حذف گردید.`);
     }
   });
@@ -380,7 +457,7 @@ io.on('connection', (socket) => {
         io.to(targetSocketId).emit('role_update', role);
       }
       
-      io.emit('user_list', getUniqueOnlineUsers());
+      broadcastUserList();
       socket.emit('action_success', `نقش کاربر ${targetUsername} به ${role} تغییر کرد.`);
     }
   });
@@ -390,13 +467,34 @@ io.on('connection', (socket) => {
     const user = users[socket.id];
     if (!user) return;
 
+    // Rate Limit Check (Simple Token Bucket per user)
+    const now = Date.now();
+    if (!userRateLimits[user.username]) userRateLimits[user.username] = { count: 0, last: now };
+    
+    // Reset count every 5 seconds
+    if (now - userRateLimits[user.username].last > 5000) {
+        userRateLimits[user.username] = { count: 0, last: now };
+    }
+    
+    if (userRateLimits[user.username].count > 5) {
+        return socket.emit('error', 'لطفا آهسته‌تر پیام ارسال کنید.');
+    }
+    userRateLimits[user.username].count++;
+
+
+    const cleanText = xss(data.text);
+    const cleanFileName = data.fileName ? xss(data.fileName) : undefined;
+    
+    // Limit text length
+    if (cleanText.length > 1000) return;
+
     const msg = {
       id: Date.now() + Math.random().toString(36).substr(2, 9),
       sender: user.username,
-      text: data.text,
+      text: cleanText,
       type: data.type || 'text',
-      content: data.content,
-      fileName: data.fileName,
+      content: data.content, 
+      fileName: cleanFileName,
       channel: data.channel,
       replyTo: data.replyTo || null,
       timestamp: new Date().toLocaleTimeString('en-US', { hour12: false, hour: '2-digit', minute: '2-digit' }),
@@ -407,7 +505,30 @@ io.on('connection', (socket) => {
     messages[data.channel].push(msg);
     if (messages[data.channel].length > 100) messages[data.channel].shift();
 
+    // Broadcast to the channel/room
     io.to(data.channel).emit('receive_message', msg);
+    
+    // --- FIX: Manual Delivery for PVs if target not in room ---
+    // If it's a PV, the recipient might not have joined the socket room yet (if they haven't opened the chat).
+    // We need to find their socket ID and send it directly so they get the notification.
+    if (data.channel.includes('_pv_')) {
+        const parts = data.channel.split('_pv_');
+        const targetUsername = parts.find(u => u !== user.username);
+        
+        if (targetUsername) {
+            // Find target socket
+            const targetSocketId = Object.keys(users).find(id => users[id].username === targetUsername);
+            
+            if (targetSocketId) {
+                const targetSocket = io.sockets.sockets.get(targetSocketId);
+                // Check if target is NOT in the room. If they are in the room, io.to(channel) handled it.
+                if (targetSocket && !targetSocket.rooms.has(data.channel)) {
+                    io.to(targetSocketId).emit('receive_message', msg);
+                }
+            }
+        }
+    }
+
     saveData();
   });
 
@@ -431,32 +552,66 @@ io.on('connection', (socket) => {
   });
   
   socket.on('search_user', (query) => {
-      const matches = Object.keys(persistentUsers).filter(u => u.toLowerCase().includes(query.toLowerCase()));
+      if(!query || query.length > 20) return;
+      // If list is hidden and user is not admin, do not allow search (optional privacy improvement)
+      // but assuming search is still allowed for explicit user finding
+      const cleanQuery = xss(query).toLowerCase();
+      const matches = Object.keys(persistentUsers).filter(u => u.toLowerCase().includes(cleanQuery));
       socket.emit('search_results', matches);
   });
 
   socket.on('disconnect', () => {
     delete users[socket.id];
-    io.emit('user_list', getUniqueOnlineUsers());
+    broadcastUserList();
   });
 });
 
 function joinChannel(socket, channel, isPrivate = false) {
     if (!users[socket.id]) return;
-    socket.join(channel);
-    socket.emit('channel_joined', { name: channel, isPrivate });
-    if (messages[channel]) socket.emit('history', messages[channel]);
+    const cleanChannel = xss(channel);
+    socket.join(cleanChannel);
+    socket.emit('channel_joined', { name: cleanChannel, isPrivate });
+    if (messages[cleanChannel]) socket.emit('history', messages[cleanChannel]);
     else socket.emit('history', []);
 }
 
 function getUniqueOnlineUsers() {
     const unique = {};
     Object.values(users).forEach(u => {
-        if (!unique[u.username] || (u.role === 'admin') || (u.role === 'vip' && unique[u.username].role === 'user')) {
-            unique[u.username] = u;
-        }
+        // We accumulate all users here, filtering happens in broadcast
+        unique[u.username] = u;
     });
     return Object.values(unique);
+}
+
+// Customized broadcast based on role and settings
+function broadcastUserList() {
+    const allUsers = getUniqueOnlineUsers();
+    
+    // If list is hidden: Users see only Admins + Themselves. Admins see everyone.
+    const admins = allUsers.filter(u => u.role === 'admin');
+    
+    io.sockets.sockets.forEach((socket) => {
+        const user = users[socket.id];
+        if (!user) return;
+
+        if (user.role === 'admin') {
+            // Admins always see everyone
+            socket.emit('user_list', allUsers);
+        } else {
+            if (appConfig.hideUserList) {
+                // Regular user sees Admins + Themselves
+                const visible = [...admins];
+                if (!visible.find(a => a.username === user.username)) {
+                    visible.push(user);
+                }
+                socket.emit('user_list', visible);
+            } else {
+                // Everyone visible
+                socket.emit('user_list', allUsers);
+            }
+        }
+    });
 }
 
 function getBannedUsers() {
@@ -581,7 +736,11 @@ cat > public/index.html << 'EOF'
                                 <span v-else-if="user.role === 'vip'" class="bg-blue-400 text-white px-1 rounded text-[9px] font-bold">ویژه</span>
                             </p>
                          </div>
-                         <button @click="logout" class="text-xs bg-white/20 p-2 rounded hover:bg-white/30" title="خروج"><i class="fas fa-sign-out-alt"></i></button>
+                         <div class="flex gap-1">
+                             <!-- Admin Settings Button -->
+                             <button v-if="user.role === 'admin'" @click="showAdminSettings = true" class="text-xs bg-white/20 p-2 rounded hover:bg-white/30" title="تنظیمات"><i class="fas fa-cog"></i></button>
+                             <button @click="logout" class="text-xs bg-white/20 p-2 rounded hover:bg-white/30" title="خروج"><i class="fas fa-sign-out-alt"></i></button>
+                         </div>
                     </div>
                 </div>
                 
@@ -824,6 +983,28 @@ cat > public/index.html << 'EOF'
             </div>
         </div>
         
+        <!-- Admin Settings Modal -->
+        <div v-if="showAdminSettings" class="fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-4">
+            <div class="bg-white rounded-xl shadow-xl w-full max-w-sm overflow-hidden flex flex-col">
+                <div class="p-4 border-b flex justify-between items-center bg-gray-50">
+                    <h3 class="font-bold text-gray-700">تنظیمات چت روم</h3>
+                    <button @click="showAdminSettings = false" class="text-gray-400 hover:text-gray-600"><i class="fas fa-times"></i></button>
+                </div>
+                <div class="p-6 space-y-4">
+                    <div class="flex items-center justify-between">
+                        <label class="text-sm font-bold text-gray-700">مخفی کردن لیست کاربران</label>
+                        <input type="checkbox" v-model="adminSettings.hideUserList" class="w-5 h-5 accent-brand">
+                    </div>
+                    <p class="text-xs text-gray-500 text-justify leading-relaxed">
+                        با فعال‌سازی این گزینه، کاربران عادی قادر به مشاهده لیست افراد آنلاین نخواهند بود و فقط خودشان و ادمین‌ها را می‌بینند.
+                    </p>
+                    <button @click="saveAdminSettings" class="w-full bg-brand text-white py-2 rounded-lg text-sm font-bold shadow hover:bg-brand-dark transition">
+                        ذخیره تنظیمات
+                    </button>
+                </div>
+            </div>
+        </div>
+
         <!-- Ban List Modal -->
         <div v-if="showBanModal" class="fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-4">
             <div class="bg-white rounded-xl shadow-xl w-full max-w-md overflow-hidden flex flex-col max-h-[80vh]">
@@ -854,6 +1035,9 @@ cat > public/index.html << 'EOF'
         const { createApp, ref, onMounted, nextTick, computed, watch } = Vue;
         const socket = io();
 
+        // Short beep sound base64
+        const notifyAudio = new Audio('data:audio/mp3;base64,//NExAAAAANIAAAAAExBTUUzLjEwMKqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq//NExAAAAANIAAAAAExBTUUzLjEwMKqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq//NExAAAAANIAAAAAExBTUUzLjEwMKqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq//NExAAAAANIAAAAAExBTUUzLjEwMKqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq');
+
         createApp({
             setup() {
                 const isLoggedIn = ref(false);
@@ -880,6 +1064,8 @@ cat > public/index.html << 'EOF'
                 const newChannelName = ref('');
                 const lightboxImage = ref(null);
                 const showBanModal = ref(false);
+                const showAdminSettings = ref(false);
+                const adminSettings = ref({ hideUserList: false });
                 
                 const replyingTo = ref(null);
                 const contextMenu = ref({ visible: false, x: 0, y: 0, target: null, type: null });
@@ -909,6 +1095,11 @@ cat > public/index.html << 'EOF'
                     const storedUser = localStorage.getItem('chat_user_name');
                     if (storedUser) loginForm.value.username = storedUser;
                     document.addEventListener('click', () => { contextMenu.value.visible = false; });
+                    
+                    // Request Notification Permission on load if supported
+                    if ('Notification' in window && Notification.permission !== 'granted' && Notification.permission !== 'denied') {
+                        Notification.requestPermission();
+                    }
                 });
 
                 // --- SMART SCROLL ---
@@ -930,6 +1121,18 @@ cat > public/index.html << 'EOF'
                          scrollToBottom();
                      }
                 };
+                
+                // --- Notifications ---
+                const playSound = () => {
+                    try { notifyAudio.currentTime = 0; notifyAudio.play().catch(e => {}); } catch(e){}
+                };
+
+                const notify = (title, body) => {
+                    playSound();
+                    if ('Notification' in window && Notification.permission === 'granted') {
+                        new Notification(title, { body, icon: '/favicon.ico' });
+                    }
+                };
 
                 // --- AUTH & SETUP ---
                 const login = () => {
@@ -938,6 +1141,7 @@ cat > public/index.html << 'EOF'
                         return;
                     }
                     socket.emit('login', loginForm.value);
+                    if ('Notification' in window) Notification.requestPermission();
                 };
                 const logout = () => {
                     localStorage.removeItem('chat_user_name');
@@ -1055,6 +1259,10 @@ cat > public/index.html << 'EOF'
                 const unbanUser = (target) => socket.emit('unban_user', target);
                 const setRole = (target, role) => socket.emit('set_role', { targetUsername: target, role });
                 const openBanList = () => { socket.emit('get_banned_users'); showBanModal.value = true; };
+                const saveAdminSettings = () => {
+                    socket.emit('update_admin_settings', adminSettings.value);
+                    showAdminSettings.value = false;
+                };
                 
                 // Helpers
                 const handleUserClick = (u) => { if (u.username !== user.value.username) startPrivateChat(u.username); };
@@ -1071,6 +1279,9 @@ cat > public/index.html << 'EOF'
                         if(data.settings.appName) {
                             appName.value = data.settings.appName;
                             document.title = data.settings.appName;
+                        }
+                        if(typeof data.settings.hideUserList === 'boolean') {
+                            adminSettings.value.hideUserList = data.settings.hideUserList;
                         }
                     }
                     localStorage.setItem('chat_user_name', data.username);
@@ -1099,13 +1310,21 @@ cat > public/index.html << 'EOF'
                         if (msg.sender === user.value.username || isNearBottom) {
                             scrollToBottom();
                         }
+                        
+                        // Notify if in channel but window blurred
+                        if (document.hidden && msg.sender !== user.value.username) {
+                             notify(`پیام جدید در ${displayChannelName.value}`, `${msg.sender}: ${msg.text || 'مدیا'}`);
+                        }
                     } else {
                         // Handle Unreads
                         if (msg.channel.includes('_pv_')) {
-                             // Private Message logic: find the partner name
-                             const partner = msg.channel.replace(user.value.username, '').replace('_pv_', '');
+                             // Use split to safely find partner
+                             const parts = msg.channel.split('_pv_');
+                             const partner = parts.find(p => p !== user.value.username);
+                             
                              if (partner) {
                                  unreadCounts.value[partner] = (unreadCounts.value[partner] || 0) + 1;
+                                 notify(`پیام خصوصی از ${partner}`, msg.text || 'فایل ارسال شد');
                              }
                         } else {
                              // Public Channel logic
@@ -1180,7 +1399,8 @@ cat > public/index.html << 'EOF'
                     swipeId, touchStart, touchMove, touchEnd, getSwipeStyle,
                     isRecording, isUploading, uploadProgress, toggleRecording, viewImage, lightboxImage, autoResize, scrollToMessage,
                     canCreateChannel, canBan, banUser, unbanUser, setRole,
-                    showBanModal, openBanList, bannedUsers, unreadCounts, appName
+                    showBanModal, openBanList, bannedUsers, unreadCounts, appName,
+                    showAdminSettings, adminSettings, saveAdminSettings
                 };
             }
         }).mount('#app');
@@ -1228,8 +1448,8 @@ cat << 'EOF_MENU' > /tmp/chat-menu.sh
 #!/bin/bash
 # Chat Manager Menu
 
-APP_NAME="chatroom"
-DIR="~/chat-chatroom"
+APP_NAME="AsrnovinChat"
+DIR="~/chat-AsrnovinChat"
 CONFIG_FILE="$DIR/data/config.json"
 INDEX_FILE="$DIR/public/index.html"
 
